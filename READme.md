@@ -16,9 +16,5 @@ This repository contains a growing collection of exploratory data analyses perfo
 2. Open the `.Rmd` file to review code, methodology, and narrative.  
 3. Click the **Live Report** link to view interactive figures and results in your browser.
 
-## Add Your Own Analyses
-Feel free to fork this repo and contribute your own exploratory analyses—just add a new folder under `docs/` with your RMarkdown and rendered report.
 
----
-*Last updated: `r Sys.Date()`*
 
