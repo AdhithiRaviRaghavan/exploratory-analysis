@@ -1,0 +1,529 @@
+---
+title: "Maize Microarray Unsupervised Analysis"
+author: "Adhithi Raghavan"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+<!---
+# Project: Maize Microarray Unsupervised Analysis
+
+**Description:**
+This RMarkdown presents a reproducible workflow for exploratory analysis of the GSE32361 maize microarray dataset.   
+It covers: data acquisition, metadata validation, unsupervised sample clustering, high-expression gene filtering,  
+three-way ANOVA for gene prioritization, heatmap visualizations, silhouette-based cluster evaluation, and PCA.
+
+**Instructions:**
+1. Ensure required packages are installed: `GEOquery`, `ggplot2`, `dplyr`, `reshape2`, `cluster`, `ggdendro`, `factoextra`.  
+2. Knit using `rmarkdown::render("MaizeData.Rmd")`.  
+3. View the output `.html` or `.md` on GitHub for interactive exploration.
+
+-->
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  error = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = 'left'
+)
+
+# Load required libraries
+library(GEOquery)
+library(ggplot2)
+library(tibble)
+library(reshape2)
+library(dplyr)
+library(cluster)
+library(ggdendro)
+library(MASS)
+library(factoextra)
+```
+
+
+# Introduction
+This document explores gene expression signatures of nitrogen-use efficiency in maize.  
+We analyze data from GSE32361, validate sample metadata, perform clustering, filter for reliable genes,  
+apply ANOVA to rank treatment-sensitive genes, visualize patterns via heatmaps, assess cluster quality, and conduct PCA.
+
+# 1. Data Loading and Inspection
+**Objective:** Download and inspect the structure of the microarray data.
+
+
+```{r}
+#BiocManager::install("GEOquery") #already loaded it
+library("GEOquery") #Otherwise wont work
+gse<-getGEO("GSE32361")
+
+# Extract expression and metadata
+expression.data <- as.data.frame(exprs(gse[[1]])) #This exprs function will give me the expression from the gse I created. The gse is a list with 1 element - so need to tell it to find find from the first element of the list.
+expression.metadata <- pData(gse[[1]])
+
+# Inspect data structure
+str(expression.data)
+```
+
+
+# 2. Metadata Preparation and perform checks
+**Objective:** Extract key metadata columns for downstream analyses.
+
+
+```{r}
+#need to extract genotypes, growth nutrient, sampling time
+#What they are called in metadata - geo_accession, genotype:ch1,  growth nutrient:ch1, sampletime:ch1
+
+#Creating a data frame - with 4 columns 
+
+library(dplyr)
+imp.metadata.columns <- expression.metadata %>% dplyr::select("geo_accession", "genotype:ch1", "growth nutrient:ch1", "sampletime:ch1") %>% as.data.frame()
+
+
+```
+
+
+
+```{r}
+#For expression data - each column has the geo accession - so need to find the number of columns
+# Number of samples
+ncol(expression.data) # should be 90
+nrow(expression.metadata) # should be 90
+ncol(expression.data) == nrow(expression.metadata)
+
+# Check sample ID correspondence
+colnames(expression.data) == rownames(expression.metadata)
+
+# Check uniqueness
+unique.ids <- unique(colnames(expression.data))
+length(unique.ids)
+
+```
+
+
+# 3. Unsupervised Clustering of Samples
+**Objective:** Compute Euclidean distances, generate dendrograms, and color by factors.
+
+
+
+```{r}
+#Loading packages 
+#install.packages("ggdendro") #Already loaded it so commenting it out
+library("ggdendro")
+
+# Calculate distance matrix and hierarchical clustering
+distance.data <- dist(t(expression.data), method = "euclidean")
+clustering <- hclust(distance.data, method = "average")
+
+dendro <- ggdendrogram(clustering, rotate = FALSE, size = 1)
+print(dendro)
+
+```
+
+
+# 3.1 Color Dendrogram by Genotype
+*What I'm doing:* Coloring sample labels on the dendrogram by genotype to explore grouping.
+
+
+```{r}
+# Order metadata to match dendrogram
+extract.order <- clustering$order
+order.imp.metadata <- imp.metadata.columns[extract.order, ]
+
+# Define color mapping for genotypes
+color.vector <- c("blue", "red", "green", "purple")
+then.color <- character(nrow(order.imp.metadata))
+for (i in seq_len(nrow(order.imp.metadata))) {
+  geno <- order.imp.metadata[i, "genotype:ch1"]
+  then.color[i] <- switch(
+    geno,
+    "Monsanto Z. mays line 1" = color.vector[1],
+    "Monsanto Z. mays line 2" = color.vector[2],
+    "Monsanto Z. mays line 3" = color.vector[3],
+    "Monsanto Z. mays line 4" = color.vector[4],
+    "black"
+  )
+}
+dendro + theme(axis.text.x = element_text(color = then.color))
+```
+
+# 3.2 Color Dendrogram by Growth Nutrient
+*What I'm doing:* Coloring sample labels by growth nutrient condition.
+
+```{r dendro-growth}
+# Define color mapping for nutrient treatments
+color.vector.growth <- c("blue", "red", "green")
+then.color.growth <- character(nrow(order.imp.metadata))
+for (i in seq_len(nrow(order.imp.metadata))) {
+  nut <- order.imp.metadata[i, "growth nutrient:ch1"]
+  then.color.growth[i] <- switch(
+    nut,
+    "20mM NH4NO3" = color.vector.growth[1],
+    "2mM and then 20mM NH4NO3" = color.vector.growth[2],
+    "2mM NH4NO3" = color.vector.growth[3],
+    "black"
+  )
+}
+dendro + theme(axis.text.x = element_text(color = then.color.growth))
+
+```
+
+
+# 3.3 Color Dendrogram by Sample Time
+*What I'm doing:* Coloring sample labels by sampling time.
+
+```{r}
+
+# Define color mapping for sample times
+color.vector.time <- c("blue", "red", "green")
+then.color.time <- character(nrow(order.imp.metadata))
+for (i in seq_len(nrow(order.imp.metadata))) {
+  tm <- order.imp.metadata[i, "sampletime:ch1"]
+  then.color.time[i] <- switch(
+    tm,
+    "10AM day1" = color.vector.time[1],
+    "10AM day2" = color.vector.time[2],
+    "11PM day1" = color.vector.time[3],
+    "black"
+  )
+}
+dendro + theme(axis.text.x = element_text(color = then.color.time))
+  
+```
+
+# 4. Filter Low-Expression Genes
+**Objective:** Retain genes with total expression above the median.
+
+
+```{r}
+# Filter Low-Expression Genes
+# Convert to data frame with gene_id column
+expr_df <- tibble::rownames_to_column(as.data.frame(expression.data), var = "gene_id")
+
+# Compute sum of expression values across numeric columns only
+numeric_cols <- sapply(expr_df, is.numeric)
+expr_df$sum.expr <- rowSums(expr_df[, numeric_cols], na.rm = TRUE)
+
+# Calculate median of summed expression
+median.sum <- median(expr_df$sum.expr)
+
+# Subset genes above the median
+gfiltered <- expr_df[expr_df$sum.expr > median.sum, ]
+
+# Remove the helper column
+gfiltered$sum.expr <- NULL
+
+# Restore row names from gene_id and drop that column
+rownames(gfiltered) <- gfiltered$gene_id
+filtered.genes <- gfiltered[, setdiff(names(gfiltered), "gene_id")]
+
+
+```
+
+
+
+# 5. Three-Way ANOVA for Gene Prioritization
+**Objective:** Identify genes significantly affected by genotype, nutrient, or time.
+
+
+
+```{r}
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+# The following function will return the smallest p-value associated with a non-intercept model term
+# This is different from the model F-statistic which does incorporate the intercept term
+# There are better ways to do this; use this way because it's relatively fast and kinda ok
+# Arguments:
+#   1) a vector of expression values
+#   2) a dataframe with the three factors as three columns
+msk3wayAnova <- function(expvalue, expfactors) {
+  templm<- lm(as.numeric(expvalue) ~ as.factor(expfactors[,1]) +
+              as.factor(expfactors[,2]) +
+              as.factor(expfactors[,3]))
+  return(min(summary(templm)$coef[-1,4]))
+}
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ #
+
+# Apply the above function to each row of the expression values.
+imp.metadata.columns.nolabels <- imp.metadata.columns[,2:4]
+filtered.gene.expression.norowsums.1 <- filtered.genes [,-1]
+filtered.gene.expression.norowsums <- filtered.gene.expression.norowsums.1[,-91]
+
+
+anovaPvalues <- apply(filtered.gene.expression.norowsums, imp.metadata.columns.nolabels, MARGIN = 1, FUN = msk3wayAnova)
+
+str(anovaPvalues)
+max(anovaPvalues)
+min(anovaPvalues)
+
+```
+
+
+# 6. Select Top 1000 Genes
+**Objective:** Choose genes with the smallest ANOVA p-values.
+
+```{r}
+
+#Identifying genes with the lowest p-values
+#Creating a data frame with the p value
+
+#For some reason I lost my gene names - so adding that again
+pval.df <- tibble::rownames_to_column(as.data.frame(anovaPvalues), var = "gene")
+
+top1000 <- pval.df %>%
+  arrange(anovaPvalues) %>%
+  slice(1:1000) %>%
+  pull(gene)
+
+selected.data <- filtered.genes[top1000, ]
+
+
+
+p.value.data.frame <- cbind(filtered.genes,anovaPvalues)
+
+library(dplyr)
+
+
+arrange.p.value <- p.value.data.frame %>% arrange(anovaPvalues) 
+
+lowest.p.value <- arrange.p.value[1:1000,] #this data frame has 2 extra columns for p-value and sum. Now that I have sorted it by p-value - I can get rid of those to create the 90 by 1000 data frame
+
+
+lowest.p.value.final <- lowest.p.value[,1:91]
+rownames(lowest.p.value.final) = NULL
+lowest.p.value.final = column_to_rownames(lowest.p.value.final,var="gene")
+```
+
+
+# 7. Heatmap of Top Genes
+**Objective:** Visualize z-scored expression for top genes.
+
+
+```{r}
+#From class notes getting the z scores
+centered.data <- sweep(lowest.p.value.final, 1, rowMeans(lowest.p.value.final), FUN = "-")
+centered.data.std.dev <-apply(centered.data , 1, sd)
+
+recentered.data <- sweep(centered.data, 1, centered.data.std.dev, FUN = "/" ) 
+
+recentered.data$genes <- rownames(recentered.data)
+recentered.data.melt<- melt(recentered.data)
+
+library(MASS)
+library(reshape2)
+#Online - https://www.r-graph-gallery.com/79-levelplot-with-ggplot2.html
+  ggplot(recentered.data.melt, aes(x  = variable, y= genes, fill=  value)) + 
+    geom_tile() +
+    scale_fill_gradient2(
+                        low = "blue", na.value = "white",
+                        high = "red") + theme(axis.text.x = element_blank(), axis.ticks.x =  element_blank()) + theme(axis.text.y =  element_blank(),  axis.ticks.y =  element_blank()) 
+  
+  
+  
+
+
+```
+
+# 8. Gene Clustering Heatmap
+**Objective:** Cluster genes and reorder heatmap rows accordingly.
+
+
+```{r}
+#Samething as before 
+#first calculating distance  #Copied code from above
+
+distance.data.new <- dist(recentered.data, method ="euclidean")
+
+clustering.new <- hclust(distance.data.new , method = "average")
+clustering.new
+
+
+#One of the things in the list is the order - extract the order - make vector 
+
+extract.order.new <- clustering.new$order
+
+ordered.names.data <- rownames(recentered.data)[extract.order.new]
+
+ggplot(recentered.data.melt, aes(x  = variable, y= genes, fill=  value)) + 
+    geom_tile() +
+    scale_fill_gradient2(
+                        low = "blue", na.value = "white",
+                        high = "red") + theme(axis.text.x = element_blank(), axis.ticks.x =  element_blank()) + theme(axis.text.y =  element_blank(),  axis.ticks.y =  element_blank()) + scale_y_discrete(limits= ordered.names.data)
+
+```
+
+# 8.1 Reorder the biological *samples* in the heatmap based on the *genotypes*. Print the new heatmap.
+
+```{r}
+ 
+arrange.genotypes <-imp.metadata.columns %>% arrange(`genotype:ch1`)
+arrange.genotypes.geo <- arrange.genotypes[,1]
+
+
+ggplot(recentered.data.melt, aes(x  = variable, y= genes, fill=  value)) + 
+    geom_tile() +
+    scale_fill_gradient2(
+                        low = "blue", na.value = "white",
+                        high = "red") + theme(axis.text.x = element_blank(), axis.ticks.x =  element_blank()) + theme(axis.text.y =  element_blank(),  axis.ticks.y =  element_blank()) + scale_y_discrete(limits= ordered.names.data) + scale_x_discrete(limits= arrange.genotypes.geo  )
+```
+
+# 8.2 Reorder the biological *samples* in the heatmap based on the *growth nutrients*. Print the new heatmap.
+
+```{r}
+arrange.growth <-imp.metadata.columns %>% arrange(`growth nutrient:ch1`)
+arrange.genotypes.growth <- arrange.growth[,1]
+
+
+ggplot(recentered.data.melt, aes(x  = variable, y= genes, fill=  value)) + 
+    geom_tile() +
+    scale_fill_gradient2(
+                        low = "blue", na.value = "white",
+                        high = "red") + theme(axis.text.x = element_blank(), axis.ticks.x =  element_blank()) + theme(axis.text.y =  element_blank(),  axis.ticks.y =  element_blank()) + scale_y_discrete(limits= ordered.names.data) + scale_x_discrete(limits= arrange.genotypes.growth)
+
+```
+
+# 8.3 Reorder the biological *samples* in the heatmap based on the *sample time*. Print the new heatmap.
+
+```{r}
+arrange.time <-imp.metadata.columns %>% arrange(`sampletime:ch1`)
+arrange.genotypes.time <- arrange.time[,1]
+
+
+ggplot(recentered.data.melt, aes(x  = variable, y= genes, fill=  value)) + 
+    geom_tile() +
+    scale_fill_gradient2(
+                        low = "blue", na.value = "white",
+                        high = "red") + theme(axis.text.x = element_blank(), axis.ticks.x =  element_blank()) + theme(axis.text.y =  element_blank(),  axis.ticks.y =  element_blank()) + scale_y_discrete(limits= ordered.names.data) + scale_x_discrete(limits= arrange.genotypes.time)
+```
+
+
+# 8.4 Interpreting patterns using the heatmaps
+
+Based on the heat map - we plotted genes on the Y axis and GSM on the X axis,  so if we look along the X-axis we can see how for the one gene how the expression is changing. Therefore, we can say that gene is varying alot if we see  more patterning along the X-axis. On the basis of this,  when we group by genotypes, we see alot of change (more patterning), showing that genotypes don't have a profound effect on the change in the gene expression. This correlates with the dendogram that we saw - where when we order by genotypes, we dont see a really see groupings for similar genotypes. When we look at the heatmap for time - we see that when we group by time, we see patterns that are constant - or large clusters, indicating time does affect gene expression. Therefore sample time based on heatmaps has the most effect on gene expression.
+
+# 8.5 Creating discrete cluster
+
+Using the heatmaps in the previous section, we see - two clusters that change according to sample time, and one cluster that changes according to nutrient.
+
+
+```{r}
+#3 clusters - based on the above
+
+cut.the.tree <- data.frame(group = cutree(clustering.new, k = 3)) #Storing it as a data drame - because otherwise it returns a vector
+
+```
+
+
+
+```{r}
+#Creating a heatmap with only the genes in the largest group. Order the x-axis by `sampletime`.
+#Determine how many genes have 1 or 2 or 3
+sum(cut.the.tree == 1) #409
+sum(cut.the.tree == 2) #191
+sum(cut.the.tree == 3) #400
+
+#The largest group is 1
+
+cut.the.tree<- rownames_to_column(cut.the.tree)
+
+#get names of gnes in group 1
+
+largest.group.gene <- cut.the.tree[cut.the.tree$group == 1, 1] %>% unlist()
+
+#TRYING - DOES NOT WORK
+# cut.1 <- cut.the.tree[cut.the.tree$group == 1,] 
+# genes.cut.1<- cut.1[,1]
+# genes.cut.1.new <- as.data.frame(genes.cut.1) #converting to data frame
+
+largest.group.gene.data<- recentered.data[largest.group.gene,]
+# largest.genes.gene <- as.data.frame(largest.group.gene.1)
+largest.group.gene.data.melt <- melt(largest.group.gene.data)
+
+#TRYING! DOESNT WORK _ DO NOT USE
+#largest.group.gene <- melt(largest.group.gene) #I have two columns of the same thing - I will remove it to confuse
+#largest.group.gene<- largest.group.gene[,-3]
+
+
+#So now doing the time thing like before 
+# arrange.time.new <-imp.metadata.columns %>% filter()
+# arrange.genotypes.time <- arrange.time[,1]
+# extract.order.new <- clustering.new$order
+# ordered.names.data <- rownames(recentered.data)[extract.order.new]
+
+#GG plot code
+ggplot(largest.group.gene.data.melt, aes(x  = variable, y= genes, fill=  value)) + 
+    geom_tile() +
+    scale_fill_gradient2(
+                        low = "blue", na.value = "white",
+                        high = "red") + theme(axis.text.x = element_blank(), axis.ticks.x =  element_blank()) + theme(axis.text.y =  element_blank(),  axis.ticks.y =  element_blank())+scale_x_discrete(limits= arrange.genotypes.time)
+
+```
+
+
+
+# 9  Silhouette Analysis for Gene Clusters
+
+```{r}
+library(cluster)
+
+empty.data.frame <-data.frame(ncol = 3) 
+k.values.new <- c(3,4,5)
+for (i in 1:length(k.values.new))  {
+  empty.data.frame.new <- cutree(clustering.new, k = k.values.new[i])
+  empty.data.frame <-  cbind(empty.data.frame, empty.data.frame.new)
+ }
+ 
+#These columns generated have bad names - renaming it
+three.cluster.names <- c("ncol","3 cluster", "4 cluster", "5 cluster")
+colnames(empty.data.frame) <- three.cluster.names
+
+#Calculate silhoutte
+three.cluster <- silhouette(empty.data.frame[,2],  dist(recentered.data))
+four.cluster <- silhouette(empty.data.frame[,3],  dist(recentered.data))
+five.cluster <- silhouette(empty.data.frame[,4],  dist(recentered.data))
+
+#Make a plot now
+
+plot.three.cluster <- plot(three.cluster, border = NA,main = "3 cluster")
+plot.four.cluster <- plot(four.cluster, border = NA, main = "4 cluster")
+plot.five.cluster <- plot(five.cluster, border = NA, main = "5 cluster")
+
+```
+
+Comparing the results to your original guess for the optimal number of groups. 
+The number of optimal of clusters should be 3. This correlates with what we set before. We can infer this with the average silhoutte width - which is the maximum for 3 clusters.
+
+# 10.  Principal Component Analysis
+**Objective:** Perform PCA on the top genes and plot PC1 vs PC2.
+
+```{r}
+#Using my code from HW11
+straight.line.pca <- prcomp(t(lowest.p.value.final), center=T, scale=T)
+summary(straight.line.pca)
+
+
+```
+
+
+#  10.1 Ploting PC1 and PC2 
+
+```{r}
+growth.time.experiment.data <- imp.metadata.columns[, 3:4] 
+
+straight.line.pca.time.exp <- as.data.frame(cbind(as.data.frame(straight.line.pca$x), growth.time.experiment.data))
+
+ggplot(straight.line.pca.time.exp, aes(x=PC1, y=PC2, shape=`growth nutrient:ch1` , col=`sampletime:ch1`)) +
+  geom_point() +
+  scale_fill_brewer() +
+  labs(x="PC1 (68.11%)", y="PC2 (20.19%)")
+
+```
+
+
+# 10.2 Interpretion the data using the PCA plot
+
+There are two clusters along the PC1. These seem to predominantly separated by time, like for cluster one on the PC1 axis - it all seems to be predominantly of 10am day1, while the second cluster seems to be all 11pm day2. Considering PC1 explains the most variance, we see the two clusters that far away from each from each, so time has the most important effect on gene expression, and 11 pm accounts for the most variability in gene expression. 
+#With respect to the PC2 they are clustered primarily as per nutrient, and we can see three clusters. Since PC2 explains the next most important variability after PC1, nutrient has the second most important effect on gene expression. The third cluster along the PC2 for 20mM NH4NO3 contributes to the most variability in gene expression for the nutrient conditions.
+
+These results correlate with earlier analysis and we see that sampling time has the most effect on the variability in gene expression, followed by nutrients and then genotype. For the dendogram we could see for sampling time, the groupings showed a pattern, and the same was explained by the heat map, where for the time when we grouped it together, we could see pattern (and constantly changing patterns).
