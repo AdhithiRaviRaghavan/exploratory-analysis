@@ -26,6 +26,8 @@ The questions are:
 2. **How does community composition and diversity differ between habitats?**
 3. **Do conclusions change when the data are treated as compositional?** 16S counts only carry relative information, so I compare a standard relative-abundance approach (Bray–Curtis) with a compositional one (centred log-ratio, CLR, and Aitchison distance).
 4. **Which genera separate host-associated from environmental communities?**
+5. **How sensitive are those results to the differential-abundance method?** I compare relative abundance, CLR and robust CLR, and check how zero handling changes the answer.
+6. **Can habitat be predicted from community composition, and where does a model fail?** A random forest, evaluated with leave-one-out cross-validation against a shuffled-label baseline.
 
 ```{r libraries}
 library(phyloseq)
@@ -33,6 +35,7 @@ library(vegan)
 library(ggplot2)
 library(dplyr)
 library(tidyr)
+library(randomForest)
 theme_set(theme_bw(base_size = 12))
 ```
 
@@ -181,8 +184,8 @@ Relative abundances sum to 1, so they are not independent: an increase in one ta
 counts <- as(otu_table(gp_f), "matrix")
 if (taxa_are_rows(gp_f)) counts <- t(counts)   # samples x taxa
 
-clr <- function(x) {
-  lx <- log(x + 0.5)
+clr <- function(x, pseudocount = 0.5) {
+  lx <- log(x + pseudocount)
   lx - rowMeans(lx)
 }
 clr_mat <- clr(counts)
@@ -264,10 +267,174 @@ cat(sum(res$fdr < 0.05), "of", nrow(res), "genera differ at FDR < 0.05\n")
 
 Host-associated samples are enriched for well-known oral, skin and gut genera, such as *Streptococcus*, *Porphyromonas*, *Finegoldia* and *Lactobacillus*, consistent with prior knowledge. Recovering expected biology like this is a useful check on the pipeline before applying it to new data.
 
+## 6. How much do the results depend on the method?
+
+The differential-abundance result above used one method: CLR with a pseudocount of 0.5, tested with Wilcoxon. A careful analysis should check whether the conclusions hold under other reasonable choices. I compare three approaches on the same genus-level host-vs-environmental question:
+
+- **Relative abundance**: proportions, not compositionally aware
+- **CLR (pseudocount 0.5)**: the approach above, where zeros are replaced by a small value
+- **Robust CLR**: log-ratios computed only from observed values. Zeros are treated as missing, so it tests abundance *when a genus is present*.
+
+```{r method-compare}
+rel_g <- gcounts / rowSums(gcounts)
+rclr_g <- as.matrix(decostand(gcounts, method = "rclr"))
+rclr_g[gcounts == 0] <- NA
+
+wilcox_p <- function(M) apply(M, 2, function(x) {
+  a <- na.omit(x[host]); b <- na.omit(x[!host])
+  if (length(a) < 2 || length(b) < 2) return(NA)
+  wilcox.test(a, b, exact = FALSE)$p.value
+})
+
+genus_labels <- make.unique(as.character(tax_table(genus)[colnames(gcounts), "Genus"]))
+methods <- list(
+  "Relative abundance" = wilcox_p(rel_g),
+  "CLR (pseudocount 0.5)" = wilcox_p(gclr),
+  "Robust CLR (present only)" = wilcox_p(rclr_g)
+)
+sig_sets <- lapply(methods, function(p) genus_labels[which(p.adjust(p, "BH") < 0.05)])
+
+cat("Share of zero counts at genus level:", round(100 * mean(gcounts == 0)), "%\n\n")
+data.frame(
+  method = names(sig_sets),
+  genera_tested = sapply(methods, function(p) sum(!is.na(p))),
+  significant_FDR_0.05 = sapply(sig_sets, length),
+  row.names = NULL
+)
+
+jaccard <- function(a, b) round(length(intersect(a, b)) / length(union(a, b)), 2)
+cat("\nOverlap between significant sets (Jaccard index):\n")
+cat("  Relative abundance vs CLR:       ", jaccard(sig_sets[[1]], sig_sets[[2]]), "\n")
+cat("  CLR vs robust CLR:               ", jaccard(sig_sets[[2]], sig_sets[[3]]), "\n")
+cat("  Significant under all three:     ", length(Reduce(intersect, sig_sets)), "genera\n")
+```
+
+The methods agree far less than one might expect. Almost half the genus-level counts are zero, and with relative abundance or pseudocount CLR, a genus present in one group and absent in the other looks like a large difference. Robust CLR asks a narrower question, abundance when present, and finds far fewer differences. So most of the signal here is about **which genera are present in each habitat**, not how abundant shared genera are. Both are valid findings, but they mean different things. A report should say which question it answers.
+
+### Sensitivity to the pseudocount
+
+```{r pseudocount}
+pc_values <- c(0.1, 0.5, 1)
+pc_sig <- lapply(pc_values, function(pc) {
+  p <- wilcox_p(clr(gcounts, pseudocount = pc))
+  genus_labels[which(p.adjust(p, "BH") < 0.05)]
+})
+names(pc_sig) <- paste("pseudocount", pc_values)
+sapply(pc_sig, length)
+
+effect <- function(M) apply(M, 2, function(x) mean(x[host]) - mean(x[!host]))
+cat("Rank correlation of effect sizes, pseudocount 0.1 vs 1:",
+    round(cor(effect(clr(gcounts, 0.1)), effect(clr(gcounts, 1)), method = "spearman"), 2), "\n")
+cat("Overlap of significant genera, pseudocount 0.1 vs 1 (Jaccard):",
+    jaccard(pc_sig[[1]], pc_sig[[3]]), "\n")
+```
+
+The ranking of genera barely changes with the pseudocount, but the number passing the significance threshold does. The ordering is robust, while the exact list of "significant" genera depends on an arbitrary choice. This is why I'd treat a single significance cut-off as a starting point for follow-up, not a final answer.
+
+## 7. Predicting habitat from community composition
+
+Can a model identify a sample's habitat from its genus-level CLR profile? With only 23 samples, the main risk is overestimating performance, so I use **leave-one-out cross-validation** (each sample is predicted by a model that never saw it). I also compare against a **shuffled-label baseline**, which shows the accuracy expected by chance.
+
+```{r rf-cv}
+X <- gclr
+colnames(X) <- make.names(genus_labels)
+y <- droplevels(sample_data(genus)$SampleType)
+
+loocv <- function(X, y, ntree = 500) {
+  pred <- character(length(y))
+  for (i in seq_along(y)) {
+    fit <- randomForest(X[-i, ], y[-i], ntree = ntree)
+    pred[i] <- as.character(predict(fit, X[i, , drop = FALSE]))
+  }
+  factor(pred, levels = levels(y))
+}
+
+pred <- loocv(X, y)
+acc <- mean(pred == y)
+
+null_acc <- replicate(50, {
+  y_perm <- sample(y)
+  mean(loocv(X, y_perm, ntree = 200) == y_perm)
+})
+
+cat("Leave-one-out accuracy:        ", round(100 * acc), "%\n")
+cat("Shuffled-label accuracy (mean):", round(100 * mean(null_acc)), "%\n")
+cat("Shuffled-label 95th percentile:", round(100 * quantile(null_acc, 0.95)), "%\n")
+```
+
+The model does far better than chance. A single accuracy figure hides where it goes wrong, so the confusion matrix matters more:
+
+```{r rf-confusion, fig.height = 5}
+cm <- as.data.frame(table(true = y, predicted = pred))
+ggplot(cm, aes(predicted, true, fill = Freq)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, "")), size = 4) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(x = "Predicted habitat", y = "True habitat", fill = "Samples",
+       title = "Leave-one-out predictions") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Where the model fails
+
+The errors are informative:
+
+- **Tongue** has only two samples, so each one is predicted by a model trained on a single tongue example. Neither is classified correctly. This is a sample-size failure, not evidence that tongue communities are indistinguishable.
+- **One skin sample is predicted as soil.** This is biologically plausible, since skin is continually exposed to environmental microbes.
+- **One freshwater sample is predicted as tongue.** There's no biological reason for this. It most likely reflects how unstable the model is when a class has only two training samples.
+
+A useful comparison is the simpler, better-powered question of whether a sample is host-associated or environmental:
+
+```{r rf-host}
+host_y <- factor(ifelse(host, "Host-associated", "Environmental"))
+host_pred <- loocv(X, host_y)
+cat("Leave-one-out accuracy, host vs environmental:", round(100 * mean(host_pred == host_y)), "%\n")
+table(true = host_y, predicted = host_pred)
+```
+
+With more samples per class and a large biological difference, this split is easy. The model's difficulty lies in the fine habitat distinctions with very few examples each. The practical lesson is that more replicates per condition would improve the model more than a more complex algorithm.
+
+Feature importance from a single random forest is itself random. With 23 samples and over 700 genera, many features carry similar information, and which ones a given forest relies on changes from run to run. To see which signals are **stable**, I fit 20 forests with different seeds, average the importance scores, and count how often each genus appears in the top 15.
+
+```{r rf-importance}
+n_runs <- 20
+imp_runs <- sapply(seq_len(n_runs), function(seed) {
+  set.seed(seed)
+  fit <- randomForest(X, y, ntree = 500, importance = TRUE)
+  importance(fit, type = 1)[, 1]
+})
+rownames(imp_runs) <- genus_labels
+
+top15_counts <- rowSums(apply(imp_runs, 2, function(v) rank(-v) <= 15))
+imp_df <- data.frame(genus = genus_labels,
+                     mean_importance = rowMeans(imp_runs),
+                     times_in_top15 = top15_counts) %>%
+  slice_max(mean_importance, n = 15)
+
+ggplot(imp_df, aes(mean_importance, reorder(genus, mean_importance), fill = times_in_top15)) +
+  geom_col() +
+  scale_fill_gradient(low = "grey80", high = "grey20", limits = c(0, n_runs)) +
+  labs(x = "Mean decrease in accuracy (average of 20 forests)", y = NULL,
+       fill = "Runs in\ntop 15",
+       title = "Genera most useful for predicting habitat")
+
+cat("Genera in the top 15 in at least half of the runs:",
+    sum(top15_counts >= n_runs / 2), "\n")
+```
+
+```{r rf-importance-text, echo = FALSE}
+stable <- imp_df$genus[imp_df$times_in_top15 >= n_runs / 2]
+```
+
+The averaged ranking is led by gut-associated anaerobes (for example *Roseburia*, *Ruminococcus*, *Parabacteroides* and *Blautia*), which reflects how distinct the faecal samples are from every other habitat. But no individual genus is reliably important: **`r if (length(stable) > 0) paste(stable, collapse = ", ") else "no genus"`** appears in the top 15 in at least half of the 20 runs.
+
+The model's accuracy is stable, but its explanation is not. Many genera are interchangeable markers of the same habitats, so no single genus should be read as *the* driver. Two general cautions apply: importance shows what a model uses, not what causes a difference, and with this few samples any ranking would need confirming on independent data.
+
 ## Limitations
 
 - **Small groups:** 2–4 samples per habitat limit statistical power, and habitat is confounded with study design.
-- **Zeros and pseudocounts:** CLR results depend on how zeros are handled. Dedicated methods (for example ALDEx2 or ANCOM-BC) model this more formally.
+- **Zeros and pseudocounts:** as section 6 shows, results depend on how zeros are handled. Dedicated methods (for example ALDEx2 or ANCOM-BC) model this more formally and would be the next step.
+- **Model evaluation:** leave-one-out cross-validation on 23 samples gives a noisy accuracy estimate. Habitat is also confounded with the original study design, so a model this good on new, independently collected samples should not be assumed.
 - **Relative, not absolute:** neither relative abundances nor CLR values say whether a taxon's absolute load changed. That would need spike-ins or total-load measurements.
 - **Reference database:** genus-level labels depend on the reference taxonomy. Unassigned taxa (dropped at genus level here) can hide real differences, especially in poorly characterised environments such as soil.
 
