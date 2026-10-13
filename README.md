@@ -20,7 +20,7 @@ A growing collection of exploratory data analyses on public datasets, written in
 
 ### Maize microarray: unsupervised analysis
 - **Question:** Which gene expression patterns mark nitrogen-use efficiency in maize?
-- **Report:** [View HTML report](https://adhithiraviraghavan.github.io/exploratory-analysis/)
+- **Report:** [View HTML report](https://adhithiraviraghavan.github.io/exploratory-analysis/index.html)
 - **Code:** [`docs/MaizeData.Rmd`](docs/MaizeData.Rmd)
 
 More analyses to be added.
