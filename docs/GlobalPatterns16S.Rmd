@@ -1,0 +1,278 @@
+---
+title: "16S microbiome analysis across habitats: composition, diversity and compositional data"
+author: "Adhithi Ravi Raghavan"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+set.seed(42)
+```
+
+## Summary
+
+This analysis explores 16S rRNA amplicon data from 26 samples across nine habitats (soil, ocean, freshwater, sediment, human gut, skin and tongue, plus mock communities) using the public **GlobalPatterns** dataset (Caporaso *et al.*, *PNAS* 2011), bundled with the `phyloseq` package.
+
+The questions are:
+
+1. **Is the data fit to analyse?** Sequencing depth, mock-community controls and low-prevalence taxa.
+2. **How does community composition and diversity differ between habitats?**
+3. **Do conclusions change when the data are treated as compositional?** 16S counts only carry relative information, so I compare a standard relative-abundance approach (Bray–Curtis) with a compositional one (centred log-ratio, CLR, and Aitchison distance).
+4. **Which genera separate host-associated from environmental communities?**
+
+```{r libraries}
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+theme_set(theme_bw(base_size = 12))
+```
+
+## 1. Data and quality control
+
+```{r load}
+data(GlobalPatterns)
+gp <- GlobalPatterns
+gp
+```
+
+### Sequencing depth
+
+Library sizes vary by more than an order of magnitude between samples, so raw counts cannot be compared directly.
+
+```{r depth}
+depth <- data.frame(
+  sample = sample_names(gp),
+  reads = sample_sums(gp),
+  habitat = sample_data(gp)$SampleType
+)
+summary(depth$reads)
+
+ggplot(depth, aes(reorder(sample, reads), reads, fill = habitat)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_log10() +
+  labs(x = NULL, y = "Reads per sample (log scale)", fill = "Habitat",
+       title = "Sequencing depth per sample")
+```
+
+### Mock-community controls
+
+Mock communities are built from a small, known set of strains, so they show how much apparent diversity comes from sequencing error, chimeras or contamination rather than biology.
+
+```{r mock}
+mock <- subset_samples(gp, SampleType == "Mock")
+mock <- prune_taxa(taxa_sums(mock) > 0, mock)
+mock_counts <- as(otu_table(mock), "matrix")
+mock_rel <- sweep(mock_counts, 2, colSums(mock_counts), "/")
+abundant <- apply(mock_rel, 1, max) >= 0.001
+
+cat("Taxa observed in mock samples:        ", ntaxa(mock), "\n")
+cat("Taxa at >= 0.1% in any mock sample:   ", sum(abundant), "\n")
+cat("Share of mock reads in those taxa:    ",
+    round(100 * sum(mock_counts[abundant, ]) / sum(mock_counts), 1), "%\n")
+```
+
+Thousands of taxa appear in the mock samples, but a few dozen account for almost all the reads. The rest is a long tail of rare, mostly spurious taxa. Two practical consequences follow: raw richness counts overstate true diversity, and rare taxa should be filtered before comparing samples. Mock samples are removed before the biological comparisons below.
+
+### Filtering
+
+Taxa seen in very few samples add noise and inflate sparsity. I keep taxa present in at least 3 samples with at least 10 reads in total.
+
+```{r filter}
+gp_bio <- subset_samples(gp, SampleType != "Mock")
+gp_bio <- prune_taxa(taxa_sums(gp_bio) > 0, gp_bio)
+
+prevalence <- apply(otu_table(gp_bio), 1, function(x) sum(x > 0))
+keep <- prevalence >= 3 & taxa_sums(gp_bio) >= 10
+gp_f <- prune_taxa(keep, gp_bio)
+
+cat("Taxa before filtering:", ntaxa(gp_bio), "\n")
+cat("Taxa after filtering: ", ntaxa(gp_f), "\n")
+cat("Reads retained:", round(100 * sum(sample_sums(gp_f)) / sum(sample_sums(gp_bio)), 1), "%\n")
+```
+
+Filtering removes most taxa but very few reads. The removed taxa are rare and largely uninformative for between-habitat comparisons.
+
+## 2. Community composition
+
+Counts are converted to relative abundances (proportions per sample), which removes differences in sequencing depth.
+
+```{r composition, fig.height = 6}
+gp_rel <- transform_sample_counts(gp_f, function(x) x / sum(x))
+phylum <- tax_glom(gp_rel, taxrank = "Phylum")
+phylum_df <- psmelt(phylum)
+
+top_phyla <- phylum_df %>%
+  group_by(Phylum) %>%
+  summarise(mean_abund = mean(Abundance)) %>%
+  slice_max(mean_abund, n = 8) %>%
+  pull(Phylum)
+
+phylum_df <- phylum_df %>%
+  mutate(Phylum = ifelse(Phylum %in% top_phyla, as.character(Phylum), "Other"))
+
+ggplot(phylum_df, aes(Sample, Abundance, fill = Phylum)) +
+  geom_col() +
+  facet_grid(~ SampleType, scales = "free_x", space = "free_x",
+             labeller = label_wrap_gen(width = 10)) +
+  labs(x = NULL, y = "Relative abundance", title = "Top phyla by habitat") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 8))
+```
+
+## 3. Alpha diversity
+
+Richness estimates depend on sequencing depth, so I rarefy to the smallest library size for alpha diversity only, and repeat the comparison on unrarefied data as a check.
+
+```{r alpha}
+gp_rare <- rarefy_even_depth(gp_f, rngseed = 42, verbose = FALSE)
+alpha <- estimate_richness(gp_rare, measures = c("Observed", "Shannon"))
+alpha$habitat <- sample_data(gp_rare)$SampleType
+
+alpha_long <- pivot_longer(alpha, c(Observed, Shannon),
+                           names_to = "metric", values_to = "value")
+
+ggplot(alpha_long, aes(reorder(habitat, value), value)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey90") +
+  geom_point(size = 2) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(x = NULL, y = NULL, title = "Alpha diversity by habitat (rarefied)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+kruskal.test(Shannon ~ habitat, data = alpha)
+```
+
+Soil and other environmental samples are far more diverse than host-associated samples. With only 2–4 samples per habitat, the Kruskal–Wallis test indicates overall differences, but pairwise comparisons would be underpowered.
+
+```{r alpha-check}
+alpha_raw <- estimate_richness(gp_f, measures = "Shannon")
+cor.test(alpha$Shannon, alpha_raw$Shannon, method = "spearman")
+```
+
+The ranking of samples by Shannon diversity is the same with and without rarefaction, so this conclusion does not depend on the normalisation choice.
+
+## 4. Beta diversity: relative abundance vs compositional
+
+### Bray–Curtis on relative abundances
+
+```{r bray}
+bray <- phyloseq::distance(gp_rel, method = "bray")
+pcoa_bray <- ordinate(gp_rel, method = "PCoA", distance = bray)
+
+plot_ordination(gp_rel, pcoa_bray, color = "SampleType") +
+  geom_point(size = 3) +
+  labs(color = "Habitat", title = "PCoA, Bray–Curtis (relative abundance)")
+```
+
+### Aitchison distance on CLR-transformed counts
+
+Relative abundances sum to 1, so they are not independent: an increase in one taxon forces apparent decreases in others. The **centred log-ratio (CLR)** transform takes the log of each taxon relative to the geometric mean of its sample. Euclidean distance on CLR values (the **Aitchison distance**) respects this compositional structure. Zeros are handled with a small pseudocount, a known limitation of this approach.
+
+```{r clr}
+counts <- as(otu_table(gp_f), "matrix")
+if (taxa_are_rows(gp_f)) counts <- t(counts)   # samples x taxa
+
+clr <- function(x) {
+  lx <- log(x + 0.5)
+  lx - rowMeans(lx)
+}
+clr_mat <- clr(counts)
+
+pca_clr <- prcomp(clr_mat, center = TRUE, scale. = FALSE)
+var_expl <- round(100 * pca_clr$sdev^2 / sum(pca_clr$sdev^2), 1)
+
+pca_df <- data.frame(pca_clr$x[, 1:2],
+                     habitat = sample_data(gp_f)$SampleType)
+
+ggplot(pca_df, aes(PC1, PC2, colour = habitat)) +
+  geom_point(size = 3) +
+  labs(x = paste0("PC1 (", var_expl[1], "%)"),
+       y = paste0("PC2 (", var_expl[2], "%)"),
+       colour = "Habitat", title = "PCA on CLR (Aitchison geometry)")
+```
+
+### Testing for habitat differences
+
+PERMANOVA tests whether habitat explains variation in community composition. It assumes similar dispersion between groups, so I check this with `betadisper`. Unequal dispersion can make PERMANOVA significant even when group centroids don't differ.
+
+```{r permanova}
+meta <- data.frame(sample_data(gp_f))
+aitchison <- dist(clr_mat)
+
+perm_bray <- adonis2(bray ~ SampleType, data = meta, permutations = 999)
+perm_ait  <- adonis2(aitchison ~ SampleType, data = meta, permutations = 999)
+
+data.frame(
+  distance = c("Bray-Curtis", "Aitchison (CLR)"),
+  R2 = round(c(perm_bray$R2[1], perm_ait$R2[1]), 3),
+  p = c(perm_bray$`Pr(>F)`[1], perm_ait$`Pr(>F)`[1])
+)
+
+anova(betadisper(bray, meta$SampleType))
+anova(betadisper(aitchison, meta$SampleType))
+```
+
+Habitat explains most of the variation under both distances (R² ≈ 0.70 for Bray–Curtis and ≈ 0.78 for Aitchison), so the main conclusion holds whichever approach is used. The dispersion check is where they differ: with Bray–Curtis, dispersion varies significantly between habitats, so part of that PERMANOVA signal reflects differences in within-habitat spread. With the Aitchison distance, dispersion does not differ significantly, so its PERMANOVA result is easier to interpret as a shift in average composition. This is one practical reason to prefer compositional methods for 16S data.
+
+## 5. Genera separating host-associated and environmental communities
+
+I compare CLR values at genus level between host-associated samples (feces, skin, tongue) and environmental samples. I use Wilcoxon tests with Benjamini–Hochberg FDR correction. CLR differences are interpreted relative to the sample's geometric mean, not as absolute abundance changes.
+
+```{r da}
+genus <- tax_glom(gp_f, taxrank = "Genus", NArm = TRUE)
+gcounts <- as(otu_table(genus), "matrix")
+if (taxa_are_rows(genus)) gcounts <- t(gcounts)
+gclr <- clr(gcounts)
+
+host <- sample_data(genus)$SampleType %in% c("Feces", "Skin", "Tongue")
+
+res <- data.frame(
+  taxon = colnames(gclr),
+  genus = as.character(tax_table(genus)[colnames(gclr), "Genus"]),
+  phylum = as.character(tax_table(genus)[colnames(gclr), "Phylum"]),
+  clr_diff = apply(gclr, 2, function(x) mean(x[host]) - mean(x[!host])),
+  p = apply(gclr, 2, function(x) wilcox.test(x[host], x[!host], exact = FALSE)$p.value)
+)
+res$fdr <- p.adjust(res$p, method = "BH")
+
+sig <- filter(res, fdr < 0.05)
+top <- bind_rows(slice_max(sig, clr_diff, n = 10),
+                 slice_min(sig, clr_diff, n = 10)) %>%
+  arrange(clr_diff) %>%
+  mutate(label = make.unique(genus, sep = " #"))   # some genera have >1 taxon
+
+ggplot(top, aes(clr_diff, reorder(label, clr_diff), fill = clr_diff > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("grey50", "steelblue"),
+                    labels = c("Higher in environmental", "Higher in host-associated")) +
+  labs(x = "Mean CLR difference (host − environmental)", y = NULL, fill = NULL,
+       title = "Top 10 genera in each direction",
+       subtitle = "Wilcoxon test, BH FDR < 0.05") +
+  theme(legend.position = "bottom")
+
+cat(sum(res$fdr < 0.05), "of", nrow(res), "genera differ at FDR < 0.05\n")
+```
+
+Host-associated samples are enriched for well-known oral, skin and gut genera, such as *Streptococcus*, *Porphyromonas*, *Finegoldia* and *Lactobacillus*, consistent with prior knowledge. Recovering expected biology like this is a useful check on the pipeline before applying it to new data.
+
+## Limitations
+
+- **Small groups:** 2–4 samples per habitat limit statistical power, and habitat is confounded with study design.
+- **Zeros and pseudocounts:** CLR results depend on how zeros are handled. Dedicated methods (for example ALDEx2 or ANCOM-BC) model this more formally.
+- **Relative, not absolute:** neither relative abundances nor CLR values say whether a taxon's absolute load changed. That would need spike-ins or total-load measurements.
+- **Reference database:** genus-level labels depend on the reference taxonomy. Unassigned taxa (dropped at genus level here) can hide real differences, especially in poorly characterised environments such as soil.
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
