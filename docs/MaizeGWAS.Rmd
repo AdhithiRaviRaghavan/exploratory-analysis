@@ -1,0 +1,274 @@
+---
+title: "Maize flowering time: GWAS, population structure and genomic prediction"
+author: "Adhithi Ravi Raghavan"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.5)
+set.seed(1)
+```
+
+## Summary
+
+This analysis runs a genome-wide association study (GWAS) of flowering time in the public **DROPS maize diversity panel**: 246 inbred lines genotyped at about 41,700 SNPs and grown in 10 field trials across Europe (Millet *et al.*, *Plant Physiology* 2016; data distributed with the `statgenGWAS` R package).
+
+The questions are:
+
+1. **How much population structure is there, and how badly does it confound a naive GWAS?**
+2. **Which correction works best?** I compare no correction, principal-component (PC) covariates, and a linear mixed model with leave-one-chromosome-out (LOCO) kinship.
+3. **If no single SNP stands out, is the trait still genetically predictable?** I use genomic prediction (GBLUP), the plant-breeding counterpart of a polygenic score, evaluated by cross-validation.
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+theme_set(theme_bw(base_size = 12))
+```
+
+## 1. Data and phenotype
+
+Each line was measured in 10 environments. To get one value per line, I fit `anthesis ~ environment + line` and take each line's estimated mean in a common environment. This removes differences between field trials.
+
+```{r data}
+# Data files from the statgenGWAS package (github.com/Biometris/statgenGWAS/tree/main/data)
+load("data/dropsMarkers.rda"); load("data/dropsPheno.rda"); load("data/dropsMap.rda")
+
+fit <- lm(anthesis ~ Experiment + Variety_ID, data = dropsPheno)
+lines <- unique(dropsPheno$Variety_ID)
+y <- predict(fit, data.frame(Variety_ID = lines, Experiment = dropsPheno$Experiment[1]))
+names(y) <- lines
+
+group <- dropsPheno$geneticGroup[match(lines, dropsPheno$Variety_ID)]
+cat("Lines:", length(y), "  Environments:", length(unique(dropsPheno$Experiment)), "\n")
+summary(y)
+```
+
+## 2. Genotype quality control
+
+```{r qc}
+G <- as.matrix(dropsMarkers[, -1])
+rownames(G) <- dropsMarkers$Ind
+G <- G[names(y), ]
+
+maf <- colMeans(G) / 2
+maf <- pmin(maf, 1 - maf)
+cat("Missing genotypes:          ", round(100 * mean(is.na(G)), 2), "%\n")
+cat("Heterozygous calls:         ", round(100 * mean(G == 1), 2), "% (expected low in inbred lines)\n")
+cat("SNPs with MAF < 0.05:       ", sum(maf < 0.05), "\n")
+
+G <- G[, maf >= 0.05]
+map <- dropsMap[match(colnames(G), dropsMap$SNP.names), ]
+cat("SNPs used for analysis:     ", ncol(G), "\n")
+```
+
+The panel has already been cleaned: there are no missing calls, very few heterozygous calls (as expected for inbred lines), and no rare variants left to remove.
+
+## 3. Population structure
+
+Maize breeding groups, such as Stiff Stalk, Lancaster and Iodent, differ in allele frequencies across the genome. If they also differ in flowering time, any SNP that tracks group membership will look associated with flowering. This is the classic confounder in GWAS.
+
+```{r pca, fig.height = 4}
+Z <- scale(G, center = TRUE, scale = FALSE)
+pca <- prcomp(Z, rank. = 10)
+var_pc <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+pc_df <- data.frame(pca$x[, 1:2], group = group, flowering = y)
+p1 <- ggplot(pc_df, aes(PC1, PC2, colour = group)) + geom_point(size = 2) +
+  labs(x = paste0("PC1 (", var_pc[1], "%)"), y = paste0("PC2 (", var_pc[2], "%)"),
+       colour = "Genetic group", title = "Genotype PCA")
+p1
+
+cat("Flowering-time variance explained by genetic group:",
+    round(100 * summary(lm(y ~ group))$r.squared), "%\n")
+cat("Flowering-time variance explained by top 4 PCs:    ",
+    round(100 * summary(lm(y ~ pca$x[, 1:4]))$r.squared), "%\n")
+```
+
+The breeding groups separate clearly, and genetic background explains a meaningful share of flowering-time variation. A GWAS that ignores this will be confounded.
+
+## 4. GWAS: three ways of handling structure
+
+I test every SNP with three models:
+
+- **Naive**: simple linear regression, no correction
+- **PC-adjusted**: regression with the top 4 principal components as covariates
+- **Mixed model (LOCO)**: a linear mixed model with a genomic relationship (kinship) matrix. Following standard practice, each chromosome is tested against a kinship matrix built from the *other* chromosomes, so a SNP's own signal isn't absorbed by the correction.
+
+```{r gwas-functions}
+# Per-SNP regression after projecting out covariates (fast, vectorised)
+scan_lm <- function(y, X, C = NULL) {
+  M <- if (is.null(C)) matrix(1, length(y)) else cbind(1, C)
+  Q <- qr.Q(qr(M))
+  ry <- y - Q %*% crossprod(Q, y)
+  RX <- X - Q %*% crossprod(Q, X)
+  ss <- colSums(RX^2)
+  b <- colSums(RX * as.vector(ry)) / ss
+  df <- length(y) - ncol(M) - 1
+  se <- sqrt((sum(ry^2) - b^2 * ss) / df / ss)
+  2 * pt(-abs(b / se), df)
+}
+
+# Linear mixed model (EMMAX-style): estimate variance ratio once under the null,
+# rotate the data by the kinship eigenvectors, then test each SNP by weighted regression
+scan_lmm <- function(y, X, K) {
+  K <- K / mean(diag(K))
+  e <- eigen(K, symmetric = TRUE); U <- e$vectors; d <- pmax(e$values, 0)
+  n <- length(y); yt <- crossprod(U, y); xt <- crossprod(U, rep(1, n))
+  nll <- function(log_delta) {
+    w <- 1 / (d + exp(log_delta)); xx <- sum(w * xt^2)
+    r <- yt - xt * sum(w * xt * yt) / xx
+    0.5 * ((n - 1) * log(sum(w * r^2) / (n - 1)) + sum(log(d + exp(log_delta))) + log(xx))
+  }
+  delta <- exp(optimize(nll, c(-10, 10))$minimum)
+  w <- 1 / sqrt(d + delta)
+  ys <- as.vector(yt * w); one <- as.vector(xt * w); Xs <- crossprod(U, X) * w
+  q <- one / sqrt(sum(one^2))
+  ry <- ys - q * sum(q * ys); RX <- Xs - outer(q, colSums(q * Xs))
+  ss <- colSums(RX^2); b <- colSums(RX * ry) / ss; df <- n - 2
+  list(p = 2 * pt(-abs(b / sqrt((sum(ry^2) - b^2 * ss) / df / ss)), df),
+       h2 = 1 / (1 + delta))
+}
+
+inflation <- function(p) median(qchisq(p, 1, lower.tail = FALSE)) / qchisq(0.5, 1)
+```
+
+```{r gwas-run}
+p_naive <- scan_lm(y, G)
+p_pc    <- scan_lm(y, G, pca$x[, 1:4])
+
+p_lmm <- numeric(ncol(G)); h2_chr <- numeric(10)
+for (chr in 1:10) {
+  on_chr <- map$Chromosome == chr
+  K_loco <- tcrossprod(Z[, !on_chr]) / sum(!on_chr)
+  res <- scan_lmm(y, G[, on_chr, drop = FALSE], K_loco)
+  p_lmm[on_chr] <- res$p; h2_chr[chr] <- res$h2
+}
+
+bonferroni <- 0.05 / ncol(G)
+results <- data.frame(
+  model = c("Naive", "PC-adjusted (4 PCs)", "Mixed model (LOCO)"),
+  genomic_inflation = round(sapply(list(p_naive, p_pc, p_lmm), inflation), 2),
+  bonferroni_hits = sapply(list(p_naive, p_pc, p_lmm), function(p) sum(p < bonferroni)),
+  fdr_hits = sapply(list(p_naive, p_pc, p_lmm), function(p) sum(p.adjust(p, "BH") < 0.05))
+)
+results
+cat("\nSNP heritability of line means (mixed model, range across LOCO fits):",
+    paste(round(range(h2_chr), 2), collapse = "–"), "\n")
+```
+
+The **genomic inflation factor** (λ) compares the median test statistic with what's expected if nothing is associated. A value near 1 means the test is well calibrated, and values far above 1 indicate confounding.
+
+### QQ plots
+
+```{r qq, fig.height = 4}
+qq <- bind_rows(lapply(seq_along(results$model), function(i) {
+  p <- sort(list(p_naive, p_pc, p_lmm)[[i]])
+  data.frame(model = results$model[i],
+             expected = -log10(ppoints(length(p))), observed = -log10(p))
+}))
+qq$model <- factor(qq$model, levels = results$model)
+
+ggplot(qq, aes(expected, observed)) +
+  geom_abline(colour = "red", linetype = 2) +
+  geom_point(size = 0.6) +
+  facet_wrap(~ model) +
+  labs(x = "Expected -log10(p)", y = "Observed -log10(p)", title = "QQ plots")
+```
+
+The naive scan departs from the diagonal almost immediately, which is the signature of confounding rather than true signal. PCs help but leave substantial inflation. The mixed model tracks the diagonal closely.
+
+### Manhattan plots
+
+```{r manhattan, fig.height = 6}
+chr_len <- tapply(map$Position, map$Chromosome, max)
+offset <- c(0, cumsum(as.numeric(chr_len))[-10])
+names(offset) <- names(chr_len)
+mh <- data.frame(chr = map$Chromosome,
+                 pos = map$Position + offset[as.character(map$Chromosome)])
+mh <- bind_rows(
+  mutate(mh, model = "Naive", logp = -log10(p_naive)),
+  mutate(mh, model = "Mixed model (LOCO)", logp = -log10(p_lmm))
+)
+mh$model <- factor(mh$model, levels = c("Naive", "Mixed model (LOCO)"))
+axis_pos <- offset + chr_len / 2
+
+ggplot(mh, aes(pos, logp, colour = factor(chr %% 2))) +
+  geom_point(size = 0.5) +
+  geom_hline(yintercept = -log10(bonferroni), colour = "red", linetype = 2) +
+  scale_colour_manual(values = c("grey30", "steelblue"), guide = "none") +
+  scale_x_continuous(breaks = axis_pos, labels = names(chr_len)) +
+  facet_wrap(~ model, ncol = 1, scales = "free_y") +
+  labs(x = "Chromosome", y = "-log10(p)",
+       title = "Manhattan plots (red line: Bonferroni threshold)")
+```
+
+```{r top-loci}
+top <- order(p_lmm)[1:10]
+data.frame(SNP = map$SNP.names[top], chromosome = map$Chromosome[top],
+           position = map$Position[top], p_mixed_model = signif(p_lmm[top], 2),
+           p_naive = signif(p_naive[top], 2))
+```
+
+**Interpretation.** Without correction, hundreds of SNPs pass the Bonferroni threshold. Almost all of them are false positives from population structure, as the inflation factor shows. Once relatedness is modelled properly, no single SNP reaches genome-wide significance. The strongest signals fall just short and are spread across several chromosomes. With only 246 lines and a highly heritable but polygenic trait, many small effects are each too weak to detect on their own.
+
+## 5. Is the trait still genetically predictable?
+
+A lack of significant hits does not mean a lack of genetic signal. Genomic prediction (GBLUP) uses all SNPs at once, the same idea as a polygenic score in human genetics. I evaluate it with **5-fold cross-validation repeated 10 times**, so every prediction is made for lines the model never saw. I compare it with a model that uses only genetic group membership, to check that it does more than recover broad ancestry.
+
+```{r gblup}
+K <- tcrossprod(Z) / ncol(Z); K <- K / mean(diag(K))
+lambda <- (1 - mean(h2_chr)) / mean(h2_chr)   # residual-to-genetic variance ratio
+
+cv_once <- function() {
+  folds <- sample(rep(1:5, length.out = length(y)))
+  pred_g <- pred_grp <- numeric(length(y))
+  for (f in 1:5) {
+    tr <- folds != f; te <- !tr
+    a <- solve(K[tr, tr] + diag(lambda, sum(tr)), y[tr] - mean(y[tr]))
+    pred_g[te] <- mean(y[tr]) + K[te, tr] %*% a
+    grp_means <- tapply(y[tr], group[tr], mean)
+    pred_grp[te] <- grp_means[group[te]]
+  }
+  c(genomic = cor(pred_g, y), group_only = cor(pred_grp, y))
+}
+cv <- t(replicate(10, cv_once()))
+round(rbind(mean = colMeans(cv), sd = apply(cv, 2, sd)), 2)
+```
+
+```{r gblup-plot, fig.height = 4}
+set.seed(2)
+folds <- sample(rep(1:5, length.out = length(y))); pred <- numeric(length(y))
+for (f in 1:5) {
+  tr <- folds != f; te <- !tr
+  a <- solve(K[tr, tr] + diag(lambda, sum(tr)), y[tr] - mean(y[tr]))
+  pred[te] <- mean(y[tr]) + K[te, tr] %*% a
+}
+ggplot(data.frame(observed = y, predicted = pred, group = group),
+       aes(predicted, observed, colour = group)) +
+  geom_abline(linetype = 2, colour = "grey50") + geom_point(size = 2) +
+  labs(x = "Predicted flowering time (cross-validated)", y = "Observed flowering time",
+       colour = "Genetic group", title = "Genomic prediction of flowering time")
+```
+
+Genomic prediction recovers a large share of flowering-time variation in unseen lines. It clearly outperforms group membership alone, so it captures genetic signal well beyond broad ancestry. This is the central lesson behind polygenic scores: individually undetectable effects add up to useful prediction.
+
+## Limitations
+
+- **Sample size:** 246 lines is small for GWAS. Real effects of modest size would need larger panels or meta-analysis to reach significance.
+- **Heritability estimate:** using line means averaged across 10 environments gives very high SNP heritability, partly because environmental noise is averaged out. It also comes from the same data used for prediction, so it is optimistic.
+- **Prediction across groups:** cross-validation mixes lines from all breeding groups. Prediction into a new, unrelated population would likely be lower, the same portability problem polygenic scores face across human ancestries.
+- **Single trait and panel:** results are specific to flowering time in this panel. Fine-mapping and replication in an independent panel would be the next steps for any candidate locus.
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
