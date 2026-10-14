@@ -1,0 +1,337 @@
+---
+title: "Human PBMC single-cell RNA-seq: clustering and cell-type annotation"
+author: "Adhithi Ravi Raghavan"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.5)
+set.seed(42)
+```
+
+## Summary
+
+This analysis takes single-cell RNA-seq data from human peripheral blood mononuclear cells (PBMCs) from raw counts to annotated cell types using **Seurat**. The dataset is the 10x Genomics PBMC 3k sample from a healthy donor.
+
+The standard workflow (QC, normalisation, PCA, graph clustering, UMAP, marker genes) is the starting point. On top of it, I ask three questions that matter when single-cell results feed into downstream decisions:
+
+1. **Are the clusters stable?** I sweep the clustering resolution and re-cluster random subsets of cells to see which clusters hold up.
+2. **Can the annotation be scored, not just eyeballed?** I score every cell against panels of canonical marker genes and assign each cluster the best-supported cell type.
+3. **Do the conclusions depend on the pipeline?** I compare against a second normalisation method (SCTransform) and against labels from an independent Scanpy analysis of the same cells.
+
+```{r libraries}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(mclust)   # adjusted Rand index
+theme_set(theme_bw(base_size = 12))
+```
+
+## 1. Data and quality control
+
+```{r load}
+# 10x Genomics PBMC 3k (healthy donor, 10x 3' v1 chemistry), stored in 10x format in data/pbmc3k
+counts <- Read10X("data/pbmc3k")
+pbmc <- CreateSeuratObject(counts, project = "pbmc3k", min.cells = 3, min.features = 200)
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+pbmc
+```
+
+*Data note:* the 10x files in `data/pbmc3k` hold the 2,638 cells that pass the standard PBMC 3k QC thresholds, as integer UMI counts (taken from the PBMC 3k example dataset in the CZI cellxgene repository). The full unfiltered matrix of about 2,700 cells is available from 10x Genomics.
+
+Three QC metrics flag low-quality cells: genes detected per cell (very low suggests empty droplets or broken cells, very high suggests doublets), total UMIs, and the fraction of mitochondrial reads (high suggests dying cells).
+
+```{r qc-plots, fig.height = 4}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0.1) &
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+```
+
+```{r qc-scatter, fig.height = 4}
+FeatureScatter(pbmc, "nCount_RNA", "nFeature_RNA") + NoLegend() |
+  FeatureScatter(pbmc, "nCount_RNA", "percent.mt") + NoLegend()
+```
+
+```{r qc-filter}
+pbmc <- subset(pbmc, nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+ncol(pbmc)
+```
+
+All cells are within the thresholds (200–2,500 genes, under 5% mitochondrial reads). Genes and UMIs rise together along one line with no separate high-count group, so there is no obvious doublet population, although doublets of similar cell types would not show up in this plot.
+
+## 2. Normalisation and dimensionality reduction
+
+```{r normalise}
+pbmc <- NormalizeData(pbmc, verbose = FALSE)
+pbmc <- FindVariableFeatures(pbmc, nfeatures = 2000, verbose = FALSE)
+pbmc <- ScaleData(pbmc, verbose = FALSE)
+pbmc <- RunPCA(pbmc, verbose = FALSE)
+```
+
+```{r hvg, fig.height = 4}
+top10 <- head(VariableFeatures(pbmc), 10)
+LabelPoints(VariableFeaturePlot(pbmc), points = top10, repel = TRUE) + NoLegend()
+```
+
+The most variable genes are already informative: platelet genes (*PPBP*, *PF4*), immunoglobulin genes from B cells, and cytotoxic genes (*GZMB*, *GNLY*, *NKG7*).
+
+```{r elbow, fig.height = 3.5}
+ElbowPlot(pbmc, ndims = 30)
+```
+
+The elbow flattens after about 10 PCs, so I use the first 10 for clustering and UMAP. Section 6 checks that the clusters do not depend on this choice, using a different normalisation and 30 PCs.
+
+## 3. Clustering and stability
+
+Seurat builds a shared nearest-neighbour graph on the PCs and finds communities with the Louvain algorithm. The `resolution` parameter controls how many clusters it returns, so I first look at how the clustering changes across resolutions.
+
+```{r resolution-sweep}
+pbmc <- FindNeighbors(pbmc, dims = 1:10, verbose = FALSE)
+resolutions <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.2)
+for (r in resolutions) pbmc <- FindClusters(pbmc, resolution = r, verbose = FALSE)
+
+sweep <- data.frame(
+  resolution = resolutions,
+  clusters = sapply(resolutions, function(r) length(unique(pbmc[[paste0("RNA_snn_res.", r)]][, 1])))
+)
+sweep$ARI_vs_previous <- c(NA, sapply(2:length(resolutions), function(i)
+  adjustedRandIndex(pbmc[[paste0("RNA_snn_res.", resolutions[i])]][, 1],
+                    pbmc[[paste0("RNA_snn_res.", resolutions[i - 1])]][, 1])))
+knitr::kable(sweep, digits = 2, col.names = c("Resolution", "Clusters", "Agreement with previous (ARI)"))
+```
+
+```{r cluster}
+pbmc <- FindClusters(pbmc, resolution = 0.5, verbose = FALSE)
+pbmc <- RunUMAP(pbmc, dims = 1:10, verbose = FALSE)
+table(Idents(pbmc))
+```
+
+I use resolution 0.5, which gives `r length(levels(Idents(pbmc)))` clusters, consistent with the main PBMC populations expected. Higher resolutions start splitting clusters into pieces that are hard to separate biologically.
+
+**Subsampling stability.** A cluster that reflects real biology should reappear when the analysis is repeated on a random subset of cells. I re-run the full pipeline (variable genes, PCA, graph, clustering) on 20 random 80% subsets. For each original cluster I record the best Jaccard overlap with any cluster in the subset; values above about 0.75 are usually considered stable.
+
+```{r stability}
+cl_full <- Idents(pbmc)
+n_rep <- 20
+jac <- matrix(NA, n_rep, nlevels(cl_full), dimnames = list(NULL, levels(cl_full)))
+ari_sub <- numeric(n_rep)
+# Draw all subsets first: Seurat functions reset the random seed internally,
+# so sampling inside the loop would give the same subset every time
+subsets <- lapply(seq_len(n_rep), function(b) sample(colnames(pbmc), round(0.8 * ncol(pbmc))))
+
+for (b in seq_len(n_rep)) {
+  cells <- subsets[[b]]
+  sub <- CreateSeuratObject(GetAssayData(pbmc, assay = "RNA", layer = "counts")[, cells])
+  sub <- NormalizeData(sub, verbose = FALSE) |> FindVariableFeatures(nfeatures = 2000, verbose = FALSE) |>
+    ScaleData(verbose = FALSE) |> RunPCA(npcs = 10, verbose = FALSE) |>
+    FindNeighbors(dims = 1:10, verbose = FALSE) |> FindClusters(resolution = 0.5, verbose = FALSE)
+  orig <- cl_full[cells]; new <- Idents(sub)[cells]
+  ari_sub[b] <- adjustedRandIndex(orig, new)
+  for (k in levels(cl_full)) {
+    a <- cells[orig == k]
+    jac[b, k] <- max(sapply(levels(new), function(m) {
+      bset <- cells[new == m]; length(intersect(a, bset)) / length(union(a, bset))
+    }))
+  }
+}
+summary(ari_sub)
+round(apply(jac, 2, median), 2)
+```
+
+```{r stability-plot, fig.height = 3.8}
+as.data.frame(jac) |>
+  pivot_longer(everything(), names_to = "cluster", values_to = "jaccard") |>
+  mutate(cluster = factor(cluster, levels = levels(cl_full))) |>
+  ggplot(aes(cluster, jaccard)) +
+  geom_boxplot(outlier.size = 0.8) +
+  geom_hline(yintercept = 0.75, linetype = "dashed") +
+  labs(x = "Cluster (full data)", y = "Best Jaccard overlap in subsample") +
+  ylim(0, 1)
+```
+
+Six of the nine clusters are recovered almost perfectly in every subset (median Jaccard of 0.91 or higher), including the small dendritic-cell and platelet clusters. The three least stable clusters, 0, 2 and 4, are the T-cell clusters identified in Section 5 (median Jaccard `r round(min(apply(jac, 2, median)[c("0", "2", "4")]), 2)`–`r round(max(apply(jac, 2, median)[c("0", "2", "4")]), 2)`). Their boundaries shift from subset to subset because naive CD4, memory CD4 and CD8 T cells form a continuum rather than separate groups. Overall, subset and full clusterings agree with a median adjusted Rand index (ARI) of `r round(median(ari_sub), 2)`.
+
+## 4. Marker genes
+
+For each cluster, I test genes that are higher in that cluster than in all other cells (Wilcoxon rank-sum test, Bonferroni-adjusted p-values).
+
+```{r markers}
+markers <- FindAllMarkers(pbmc, only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.25, verbose = FALSE)
+top_markers <- markers |>
+  filter(p_val_adj < 0.05) |>
+  group_by(cluster) |>
+  slice_max(avg_log2FC, n = 5) |>
+  summarise(top_genes = paste(gene, collapse = ", "), .groups = "drop")
+knitr::kable(top_markers, col.names = c("Cluster", "Top 5 markers by fold change"))
+```
+
+```{r marker-heatmap, fig.height = 7}
+top8 <- markers |> group_by(cluster) |> slice_max(avg_log2FC, n = 8)
+DoHeatmap(subset(pbmc, downsample = 100), features = top8$gene, size = 3.5) +
+  theme(axis.text.y = element_text(size = 6)) + NoLegend()
+```
+
+## 5. Cell-type annotation
+
+Rather than naming clusters by eye, I score every cell against short panels of canonical markers for PBMC cell types (`AddModuleScore`, which compares each panel with random genes of similar expression). Each cluster is then assigned the cell type with the highest average score.
+
+```{r panels}
+panels <- list(
+  `Naive CD4 T` = c("CCR7", "LEF1", "SELL", "TCF7", "MAL"),
+  `Memory CD4 T` = c("S100A4", "AQP3", "ANXA1", "CD40LG", "ITGB1"),
+  `CD8 T` = c("CD8A", "CD8B", "GZMK", "CCL5", "GZMH"),
+  `NK` = c("GNLY", "NKG7", "GZMB", "PRF1", "KLRD1", "SPON2"),
+  `B` = c("MS4A1", "CD79A", "CD79B", "CD19", "BANK1"),
+  `CD14+ Mono` = c("CD14", "LYZ", "S100A8", "S100A9", "FCN1"),
+  `FCGR3A+ Mono` = c("FCGR3A", "MS4A7", "LST1", "IFITM2", "CDKN1C"),
+  `Dendritic` = c("FCER1A", "CST3", "CLEC10A", "CD1C", "HLA-DQA1"),
+  `Platelet` = c("PPBP", "PF4", "GP9", "ITGA2B", "TUBB1")
+)
+pbmc <- AddModuleScore(pbmc, features = panels, name = "panel", seed = 42)
+score_cols <- paste0("panel", seq_along(panels))
+colnames(pbmc@meta.data)[match(score_cols, colnames(pbmc@meta.data))] <- make.names(names(panels))
+score_names <- make.names(names(panels))
+
+cluster_scores <- pbmc@meta.data |>
+  mutate(cluster = Idents(pbmc)) |>
+  group_by(cluster) |>
+  summarise(across(all_of(score_names), mean), .groups = "drop")
+
+best <- apply(as.matrix(cluster_scores[, score_names]), 1, function(s) {
+  o <- order(s, decreasing = TRUE); c(names(panels)[o[1]], round(s[o[1]] - s[o[2]], 2))
+})
+annotation <- data.frame(cluster = cluster_scores$cluster, cell_type = best[1, ],
+                         margin_over_next = as.numeric(best[2, ]),
+                         cells = as.vector(table(Idents(pbmc))[as.character(cluster_scores$cluster)]),
+                         row.names = NULL)
+stopifnot(!anyDuplicated(annotation$cell_type))
+knitr::kable(annotation, col.names = c("Cluster", "Assigned cell type", "Score margin over next best", "Cells"))
+```
+
+```{r score-heatmap, fig.height = 4.2}
+cluster_scores |>
+  pivot_longer(-cluster, names_to = "panel", values_to = "score") |>
+  mutate(panel = factor(panel, levels = score_names, labels = names(panels))) |>
+  ggplot(aes(panel, cluster, fill = score)) +
+  geom_tile(colour = "white") +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick") +
+  labs(x = "Marker panel", y = "Cluster", fill = "Mean\nscore") +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+```
+
+The score margin shows how clearly each cluster is assigned. The naive CD4 T-cell cluster has the smallest margin, which is expected: naive and memory CD4 T cells share most of their markers and differ by degree, not by on/off genes.
+
+```{r label}
+new_ids <- setNames(annotation$cell_type, as.character(annotation$cluster))
+pbmc$cell_type <- factor(unname(new_ids[as.character(pbmc$seurat_clusters)]), levels = annotation$cell_type)
+Idents(pbmc) <- "cell_type"
+```
+
+```{r umap, fig.width = 10, fig.height = 4.8}
+DimPlot(pbmc, group.by = "seurat_clusters", label = TRUE) + NoLegend() + ggtitle("Clusters") |
+  DimPlot(pbmc, label = TRUE, repel = TRUE, label.size = 3.5) + NoLegend() + ggtitle("Cell types")
+```
+
+```{r dotplot, fig.width = 10, fig.height = 4.2}
+key_genes <- c("CCR7", "LEF1", "S100A4", "IL7R", "CD8A", "GZMK", "GNLY", "NKG7",
+               "MS4A1", "CD79A", "CD14", "LYZ", "FCGR3A", "MS4A7", "FCER1A", "CST3", "PPBP")
+DotPlot(pbmc, features = key_genes) + RotatedAxis() + labs(x = NULL, y = NULL)
+```
+
+## 6. Do the conclusions depend on the pipeline?
+
+**Against an independent analysis.** The same cells were analysed independently in the Scanpy PBMC 3k tutorial (Python, different normalisation and clustering code). Those labels are not ground truth, but agreement between two separate pipelines is good evidence that the cell types are real.
+
+```{r scanpy-compare}
+scanpy <- read.csv("data/scanpy_louvain_labels.csv", row.names = 1)
+pbmc$scanpy <- scanpy[colnames(pbmc), "louvain"]
+tab <- table(Seurat = pbmc$cell_type, Scanpy = pbmc$scanpy)
+knitr::kable(as.data.frame.matrix(tab))
+```
+
+```{r scanpy-ari}
+# Scanpy labels CD4 T cells as one group, so merge naive and memory CD4 for a like-for-like comparison
+merged <- ifelse(grepl("CD4", pbmc$cell_type), "CD4 T", as.character(pbmc$cell_type))
+to_scanpy <- c("CD4 T" = "CD4 T cells", "CD8 T" = "CD8 T cells", "NK" = "NK cells", "B" = "B cells",
+               "CD14+ Mono" = "CD14+ Monocytes", "FCGR3A+ Mono" = "FCGR3A+ Monocytes",
+               "Dendritic" = "Dendritic cells", "Platelet" = "Megakaryocytes")
+pct_agree <- 100 * mean(unname(to_scanpy[merged]) == pbmc$scanpy)
+c(ARI_all_clusters = adjustedRandIndex(pbmc$cell_type, pbmc$scanpy),
+  ARI_CD4_merged = adjustedRandIndex(merged, pbmc$scanpy),
+  percent_same_cell_type = pct_agree)
+```
+
+Across all clusters the agreement is moderate (ARI `r round(adjustedRandIndex(pbmc$cell_type, pbmc$scanpy), 2)`), but almost all of the difference is that Scanpy did not split CD4 T cells into naive and memory. Once they are merged, the two pipelines give the same cell type to `r round(pct_agree, 1)`% of cells. The remaining disagreements are mostly T cells near the CD4/CD8 boundary.
+
+**Against a different normalisation.** Log-normalisation scales each cell by its total counts, which can leave technical variation from sequencing depth in the data. SCTransform instead fits a regularised negative binomial model per gene. I repeat the clustering with SCTransform (30 PCs, as recommended for this method) and compare.
+
+```{r sct}
+sct <- SCTransform(pbmc, verbose = FALSE, seed.use = 42)
+sct <- RunPCA(sct, verbose = FALSE) |> FindNeighbors(dims = 1:30, verbose = FALSE) |>
+  FindClusters(resolution = 0.5, verbose = FALSE)
+pbmc$sct_clusters <- Idents(sct)[colnames(pbmc)]
+c(SCT_clusters = nlevels(Idents(sct)),
+  ARI_vs_lognormalise = adjustedRandIndex(pbmc$sct_clusters, pbmc$seurat_clusters))
+```
+
+```{r sct-table}
+knitr::kable(as.data.frame.matrix(table(`Cell type (log-normalise)` = pbmc$cell_type,
+                                        `SCTransform cluster` = pbmc$sct_clusters)))
+```
+
+SCTransform reproduces B cells, both monocyte types, NK cells, dendritic cells and platelets almost one-to-one. The overall disagreement (ARI `r round(adjustedRandIndex(pbmc$sct_clusters, pbmc$seurat_clusters), 2)`) comes almost entirely from T cells: SCTransform draws the naive/memory CD4 boundary in a different place and moves some CD4 T cells into the CD8 cluster. Together with the subsampling result, this shows that the T-cell subsets are the least certain part of the annotation, while the major lineages are robust.
+
+## 7. Biology: two kinds of monocytes
+
+PBMCs contain classical (CD14+) and non-classical (FCGR3A+/CD16+) monocytes, which have different roles in inflammation. A direct comparison between the two clusters shows what separates them.
+
+```{r mono-de}
+mono <- FindMarkers(pbmc, ident.1 = "FCGR3A+ Mono", ident.2 = "CD14+ Mono",
+                    logfc.threshold = 0, min.pct = 0.1, verbose = FALSE)
+mono$gene <- rownames(mono)
+mono$sig <- mono$p_val_adj < 0.05 & abs(mono$avg_log2FC) > 1
+table(Higher_in = ifelse(!mono$sig, "not significant",
+                         ifelse(mono$avg_log2FC > 0, "FCGR3A+ Mono", "CD14+ Mono")))
+```
+
+```{r volcano, fig.height = 5}
+lab_genes <- mono |> filter(sig) |> group_by(sign(avg_log2FC)) |> slice_max(abs(avg_log2FC), n = 10)
+ggplot(mono, aes(avg_log2FC, -log10(p_val_adj + 1e-300), colour = sig)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  ggrepel::geom_text_repel(data = lab_genes, aes(label = gene), size = 3, colour = "black", max.overlaps = 30) +
+  scale_colour_manual(values = c(`FALSE` = "grey70", `TRUE` = "firebrick")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  labs(x = "log2 fold change (FCGR3A+ vs CD14+ monocytes)", y = "-log10 adjusted p", colour = "|log2FC| > 1, adj p < 0.05")
+```
+
+Classical monocytes are marked by the alarmins *S100A8* and *S100A12* and by *CD14*, the co-receptor for bacterial lipopolysaccharide, consistent with their role in rapid inflammatory responses. Non-classical monocytes are marked by *FCGR3A* (CD16), the classic non-classical monocyte marker *CDKN1C*, and complement gene *C1QA*, consistent with their patrolling and clearance role along blood vessels. More genes are higher in non-classical monocytes (`r sum(mono$sig & mono$avg_log2FC > 0)`) than in classical monocytes (`r sum(mono$sig & mono$avg_log2FC < 0)`).
+
+## Key findings
+
+- After QC, `r ncol(pbmc)` cells formed `r nlevels(cl_full)` clusters, which marker scoring assigned to `r length(unique(annotation$cell_type))` PBMC cell types: naive and memory CD4 T cells, CD8 T cells, NK cells, B cells, two monocyte types, dendritic cells and platelets.
+- B cells, monocytes, NK cells, dendritic cells and platelets were highly reproducible when re-clustering random 80% subsets. The T-cell subsets were the least stable, because naive CD4, memory CD4 and CD8 T cells form a continuum.
+- An independent Scanpy analysis of the same cells agreed on the cell type of `r round(pct_agree, 1)`% of cells, once naive and memory CD4 T cells were merged.
+- The major lineages did not depend on normalisation; with SCTransform, only the boundaries between T-cell subsets moved.
+- Non-classical (FCGR3A+) and classical (CD14+) monocytes differ in `r sum(mono$sig)` genes (adjusted p < 0.05, more than two-fold change).
+- **Takeaway:** major PBMC cell types can be called confidently from this data, but finer T-cell subsets need extra evidence, such as a reference atlas or surface-protein data (CITE-seq).
+
+## Limitations
+
+- **One donor, one sample.** There are no biological replicates, so this analysis describes cell types but cannot test differences between people or conditions. That would need several donors per group and pseudobulk differential expression to avoid treating cells as independent replicates.
+- **Marker-based annotation** depends on the chosen marker panels. Mapping to a large reference atlas (for example Azimuth or CellTypist) would give finer and more standardised labels.
+- **No dedicated doublet detection.** The QC plots show no obvious doublet population, but a tool such as scDblFinder would be needed to catch doublets of similar cell types.
+- **Rare cell types are small.** Dendritic cells and platelets are only a few dozen cells each, so their marker lists are less reliable than for the large populations.
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
