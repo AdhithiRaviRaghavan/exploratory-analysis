@@ -4,6 +4,13 @@ A growing collection of exploratory data analyses on public datasets, written in
 
 ## Analyses
 
+### Human PBMC single-cell RNA-seq: clustering and cell-type annotation
+- **Question:** Which cell types are present in human blood, and how robust are the clusters and labels to subsampling, normalisation and an independent pipeline?
+- **Data:** 10x Genomics PBMC 3k: 2,638 peripheral blood mononuclear cells from a healthy donor
+- **Methods:** Seurat QC, normalisation, PCA, graph-based clustering and UMAP; resolution sweep and subsampling stability (ARI, Jaccard); marker genes (Wilcoxon); cell-type annotation by marker-panel module scores; comparison with SCTransform and with an independent Scanpy analysis; classical vs non-classical monocyte differential expression
+- **Report:** [View HTML report](https://adhithiraviraghavan.github.io/exploratory-analysis/PBMCSingleCell.html)
+- **Code:** [`docs/PBMCSingleCell.Rmd`](docs/PBMCSingleCell.Rmd)
+
 ### Maize flowering time: GWAS and genomic prediction
 - **Question:** How does population structure confound GWAS, which correction works best, and is a polygenic trait predictable even without individually significant SNPs?
 - **Data:** DROPS maize diversity panel: 246 inbred lines, ~41,700 SNPs, 10 field trials (Millet *et al.*, *Plant Physiology* 2016; data from the [`statgenGWAS`](https://github.com/Biometris/statgenGWAS) package)
@@ -36,6 +43,7 @@ rmarkdown::render("docs/MaizeGWAS.Rmd")
 Package requirements:
 
 ```r
-install.packages(c("ggplot2", "dplyr", "tidyr", "vegan", "randomForest", "rmarkdown"))
+install.packages(c("ggplot2", "dplyr", "tidyr", "patchwork", "ggrepel", "mclust", "vegan",
+                   "randomForest", "statgenGWAS", "Seurat", "rmarkdown"))
 BiocManager::install("phyloseq")
 ```
