@@ -1,0 +1,218 @@
+---
+title: "Gene X knockdown rescue assay: replicates, blocking and partial rescue"
+author: "Adhithi Ravi Raghavan"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.5)
+set.seed(1)
+```
+
+## Summary
+
+This analysis looks at a **synthetic** cell-viability assay. A scientist tested whether knocking down **Gene X** rescues low viability in patient-derived disease cells, using two independent guides and a healthy reference.
+
+The questions are:
+
+1. **What is the real sample size?** There are 96 wells, but how many independent replicates?
+2. **Does each knockdown raise viability compared with the disease control?**
+3. **How much of the gap to healthy cells does each guide close?**
+
+```{r libraries}
+library(tidyverse)
+library(emmeans)
+library(patchwork)
+theme_set(theme_bw(base_size = 12))
+```
+
+## 1. Data and design
+
+```{r data}
+d <- read_csv("data/rescue_assay.csv", show_col_types = FALSE) |>
+  mutate(
+    condition = factor(condition, levels = c("Healthy_NTC", "Disease_NTC",
+                                             "Disease_GeneX_g1", "Disease_GeneX_g2")),
+    donor = factor(donor),
+    day = factor(day),
+    block = interaction(donor, day, sep = "_")   # donor x plate/day
+  )
+
+table(d$plate, d$day)
+xtabs(~ condition + block, d)
+```
+
+The design is 3 donors × 4 conditions × 2 days × 4 wells, fully balanced, with no missing values. Three things matter:
+
+- **Wells are technical replicates.** The independent unit is the **donor (n = 3)**, not the well (n = 96).
+- **Plate is confounded with day.** Plate P1 was always Day 1 and P2 always Day 2, so a plate effect can't be separated from a day effect. Every condition is on every plate, though, so each donor × plate is a complete block and condition comparisons within it are protected.
+- **Well IDs are reused** (He1–4, Di1–4) across plates and conditions, so a well ID alone does not identify a well.
+
+### Outliers and variance
+
+```{r outliers}
+d <- d |>
+  group_by(condition, donor, day) |>
+  mutate(fold_vs_cell = viability_score / median(viability_score),
+         flag = abs(log2(fold_vs_cell)) > 1) |>   # > 2-fold off its replicates
+  ungroup()
+
+filter(d, flag) |> select(donor, day, condition, well, viability_score, fold_vs_cell)
+
+cell <- d |> filter(!flag) |>
+  group_by(condition, donor, day) |>
+  summarise(mean = mean(viability_score), sd = sd(viability_score), .groups = "drop")
+cor(cell$mean, cell$sd)
+```
+
+One Healthy well (D1, Day 2) reads 412, about 3× its replicates. It looks like a data-entry or plate-reader error, so I exclude it and check the main result with it kept in (section 6). I screen on fold-difference from the replicate median rather than a MAD-based z-score, which overreacts in cells with very tight replicates.
+
+Within-cell SD rises with the mean, so I model on the **log scale**: effects become fold-changes and the spread becomes roughly constant.
+
+```{r clean}
+d_clean <- filter(d, !flag)
+```
+
+## 2. Structure of the data
+
+```{r plot, fig.height = 9}
+p1 <- ggplot(d, aes(condition, viability_score, colour = donor)) +
+  geom_point(aes(shape = flag),
+             position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.6),
+             alpha = 0.6) +
+  stat_summary(aes(group = donor), fun = mean, geom = "line",
+               position = position_dodge(0.6)) +
+  facet_wrap(~ day) +
+  scale_y_log10() +
+  scale_shape_manual(values = c(16, 4), labels = c("ok", "flagged outlier"), name = NULL) +
+  labs(title = "Wells by donor and day (log scale)", x = NULL, y = "Viability score") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p2 <- d_clean |>
+  group_by(condition, donor, day) |>
+  summarise(m = mean(viability_score), .groups = "drop") |>
+  ggplot(aes(condition, m, group = interaction(donor, day), colour = donor, linetype = day)) +
+  geom_line() + geom_point() +
+  scale_y_log10() +
+  labs(title = "Donor × day means", x = NULL, y = "Mean viability") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p1 / p2
+```
+
+All six donor × day profiles have the same shape: healthy is high, the disease control is low, guide 1 recovers more than guide 2. Day 2 reads higher across the board, and donors differ in baseline.
+
+## 3. Model
+
+I average the wells to one mean per donor × day × condition (24 values) and fit a log-scale linear model with a fixed effect for each donor × day block:
+
+- Averaging stops the 4 technical wells being counted as independent samples.
+- The block term removes each donor's baseline and the day/plate shift.
+- The condition effect is then tested against how consistently it repeats across donors and days, not against well-to-well noise.
+
+```{r model}
+agg <- d_clean |>
+  group_by(condition, donor, day, block) |>
+  summarise(y = mean(viability_score), .groups = "drop")
+
+m_agg <- lm(log(y) ~ condition + block, data = agg)
+anova(m_agg)
+```
+
+A well-level mixed model, `lmer(log(y) ~ condition + day + (1|donor) + (1|donor:day) + (1|donor:condition))`, would give the same estimates; with balanced data and only three donors the averaged model is simpler and its degrees of freedom are honest.
+
+## 4. Assumptions
+
+```{r diagnostics, fig.height = 4}
+par(mfrow = c(1, 2))
+plot(fitted(m_agg), resid(m_agg), xlab = "Fitted (log)", ylab = "Residual",
+     main = "Residuals vs fitted"); abline(h = 0, lty = 2)
+qqnorm(resid(m_agg)); qqline(resid(m_agg))
+shapiro.test(resid(m_agg))
+```
+
+Residuals show no pattern against fitted values and sit close to the Q-Q line. With 24 values these checks have little power, so they rule out gross problems only.
+
+## 5. Knockdowns vs disease control
+
+```{r contrasts}
+ctr <- contrast(emmeans(m_agg, ~ condition), method = "trt.vs.ctrl", ref = "Disease_NTC",
+                type = "response", adjust = "dunnett")
+confint(ctr)
+ctr
+```
+
+As a stricter check, I collapse the days too, leaving one value per donor × condition, so the effect is tested only against donor-to-donor variation (6 df):
+
+```{r donor-level}
+agg_donor <- agg |> group_by(condition, donor) |>
+  summarise(y = exp(mean(log(y))), .groups = "drop")
+m_donor <- lm(log(y) ~ condition + donor, data = agg_donor)
+confint(contrast(emmeans(m_donor, ~ condition), "trt.vs.ctrl", ref = "Disease_NTC",
+                 type = "response", adjust = "dunnett"))
+```
+
+Both knockdowns raise viability well above the disease control, and the conclusion is the same at either level.
+
+## 6. How much of the gap is rescued?
+
+The fraction rescued is (knockdown − disease control) / (healthy − disease control) on the log scale: 1 is full rescue, 0 is none. Because healthy is the reference level, this is `1 − b_kd / b_disease` in terms of model coefficients, and I get a confidence interval with the delta method.
+
+```{r rescue}
+rescue_ci <- function(m, kd) {
+  b <- coef(m); V <- vcov(m)
+  nm <- c(paste0("condition", kd), "conditionDisease_NTC")
+  est <- 1 - b[nm[1]] / b[nm[2]]
+  grad <- c(-1 / b[nm[2]], b[nm[1]] / b[nm[2]]^2)
+  se <- sqrt(drop(t(grad) %*% V[nm, nm] %*% grad))
+  q <- qt(0.975, df.residual(m))
+  tibble(guide = kd, fraction = est, lower = est - q * se, upper = est + q * se)
+}
+bind_rows(rescue_ci(m_agg, "Disease_GeneX_g1"),
+          rescue_ci(m_agg, "Disease_GeneX_g2"))
+```
+
+With only three donors, the per-donor values are the most transparent summary:
+
+```{r rescue-per-donor}
+agg |>
+  mutate(ly = log(y)) |>
+  select(donor, day, condition, ly) |>
+  pivot_wider(names_from = condition, values_from = ly) |>
+  transmute(donor, day,
+            g1 = (Disease_GeneX_g1 - Disease_NTC) / (Healthy_NTC - Disease_NTC),
+            g2 = (Disease_GeneX_g2 - Disease_NTC) / (Healthy_NTC - Disease_NTC))
+```
+
+I don't use a donor bootstrap here: with three donors there are only 10 distinct resamples, so the interval would mostly reflect the most extreme donors and be too narrow.
+
+### Sensitivity: outlier kept
+
+```{r sensitivity}
+agg_all <- d |> group_by(condition, donor, day, block) |>
+  summarise(y = mean(viability_score), .groups = "drop")
+m_all <- lm(log(y) ~ condition + block, data = agg_all)
+confint(contrast(emmeans(m_all, ~ condition), "trt.vs.ctrl", ref = "Disease_NTC",
+                 type = "response", adjust = "dunnett"))
+```
+
+Keeping the 412 well only moves the healthy estimate; the knockdown effects are unchanged.
+
+## Conclusions
+
+- **Finding:** Gene X knockdown substantially raised viability in disease cells from all three donors. Guide 1 closed about two-thirds of the gap to healthy cells and guide 2 about one-third.
+- **Confidence:** the effect was very consistent across donors and days, but rests on three donors from one experiment, and the two guides disagree on its size.
+- **Next step:** confirm knockdown efficiency for each guide (qPCR or western blot) to see whether the difference tracks knockdown level, add a third guide or a rescue construct to rule out off-target effects, and repeat in more donors.
+
+### Limitations
+
+- The data are synthetic, and the donors are unusually consistent, so the intervals are narrower than real data with n = 3 would give.
+- Plate and day are confounded, and the plate layout is unknown, so position effects (such as edge wells) can't be ruled out.
+- The rescue fraction is defined on the log scale; on the raw scale the percentages differ somewhat.

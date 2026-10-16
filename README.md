@@ -1,8 +1,15 @@
 # Exploratory Analysis
 
-A growing collection of exploratory data analyses on public datasets, written in R Markdown. Each analysis lives in the `docs/` folder, with the source (`.Rmd`) and a rendered HTML report you can view in the browser.
+A growing collection of exploratory data analyses on public and synthetic datasets, written in R Markdown. Each analysis lives in the `docs/` folder, with the source (`.Rmd`) and a rendered HTML report you can view in the browser.
 
 ## Analyses
+
+### Gene X knockdown rescue assay: replicates, blocking and partial rescue
+- **Question:** Does knocking down Gene X rescue low viability in patient-derived disease cells, and how much of the gap to healthy cells does each guide close?
+- **Data:** synthetic cell-viability assay: 3 donors × 4 conditions (healthy, disease control, two Gene X guides) × 2 days × 4 wells
+- **Methods:** identifying the true replicate (donor, not well) and plate/day confounding; outlier screen with sensitivity analysis; log-scale linear model on donor × day means with blocking; Dunnett comparisons against the disease control (`emmeans`); fraction of the gap rescued with a delta-method confidence interval
+- **Report:** [View HTML report](https://adhithiraviraghavan.github.io/exploratory-analysis/GeneXRescue.html)
+- **Code:** [`docs/GeneXRescue.Rmd`](docs/GeneXRescue.Rmd)
 
 ### Human PBMC single-cell RNA-seq: clustering and cell-type annotation
 - **Question:** Which cell types are present in human blood, and how robust are the clusters and labels to subsampling, normalisation and an independent pipeline?
@@ -43,7 +50,7 @@ rmarkdown::render("docs/MaizeGWAS.Rmd")
 Package requirements:
 
 ```r
-install.packages(c("ggplot2", "dplyr", "tidyr", "patchwork", "ggrepel", "mclust", "vegan",
+install.packages(c("ggplot2", "dplyr", "tidyr", "tidyverse", "emmeans", "patchwork", "ggrepel", "mclust", "vegan",
                    "randomForest", "statgenGWAS", "Seurat", "rmarkdown"))
 BiocManager::install("phyloseq")
 ```
